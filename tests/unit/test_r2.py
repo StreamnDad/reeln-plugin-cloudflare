@@ -8,7 +8,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 from botocore.exceptions import ClientError
 
-from reeln_cloudflare_plugin.r2 import R2Config, R2Error, object_exists, upload_file
+from reeln_cloudflare_plugin.r2 import (
+    R2Config,
+    R2Error,
+    delete_object,
+    object_exists,
+    upload_file,
+)
 
 
 @pytest.fixture()
@@ -153,6 +159,39 @@ class TestUploadFile:
         assert call_args is not None
         # No Config kwarg when throttle is disabled
         assert "Config" not in call_args.kwargs
+
+
+class TestDeleteObject:
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_delete_success(self, mock_create: MagicMock, r2_config: R2Config) -> None:
+        mock_client = MagicMock()
+        mock_create.return_value = mock_client
+
+        delete_object(r2_config, "videos/highlight.mp4")
+
+        mock_client.delete_object.assert_called_once_with(
+            Bucket="test-bucket", Key="videos/highlight.mp4"
+        )
+
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_delete_client_creation_failure(
+        self, mock_create: MagicMock, r2_config: R2Config
+    ) -> None:
+        mock_create.side_effect = Exception("Bad credentials")
+
+        with pytest.raises(R2Error, match="Failed to create R2 client"):
+            delete_object(r2_config, "key.mp4")
+
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_delete_boto3_failure(
+        self, mock_create: MagicMock, r2_config: R2Config
+    ) -> None:
+        mock_client = MagicMock()
+        mock_client.delete_object.side_effect = Exception("Access denied")
+        mock_create.return_value = mock_client
+
+        with pytest.raises(R2Error, match="R2 delete failed"):
+            delete_object(r2_config, "key.mp4")
 
 
 class TestObjectExists:

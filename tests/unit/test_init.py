@@ -9,7 +9,7 @@ from reeln_cloudflare_plugin.plugin import CloudflarePlugin
 class TestPackageExports:
     def test_version_string(self) -> None:
         assert isinstance(reeln_cloudflare_plugin.__version__, str)
-        assert reeln_cloudflare_plugin.__version__ == "0.1.0"
+        assert reeln_cloudflare_plugin.__version__ == "0.2.0"
 
     def test_cloudflare_plugin_export(self) -> None:
         assert hasattr(reeln_cloudflare_plugin, "CloudflarePlugin")

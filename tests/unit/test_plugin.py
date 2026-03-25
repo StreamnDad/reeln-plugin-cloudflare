@@ -23,7 +23,7 @@ class TestCloudflarePluginAttributes:
 
     def test_version(self) -> None:
         plugin = CloudflarePlugin()
-        assert plugin.version == "0.1.0"
+        assert plugin.version == "0.2.0"
 
     def test_api_version(self) -> None:
         plugin = CloudflarePlugin()
@@ -92,6 +92,14 @@ class TestCloudflarePluginConfigSchema:
         assert field.default == "auto"
 
 
+class TestCloudflarePluginConfigSchemaCleanup:
+    def test_cleanup_after_game_default_false(self) -> None:
+        schema = CloudflarePlugin.config_schema
+        field = schema.field_by_name("cleanup_after_game")
+        assert field is not None
+        assert field.default is False
+
+
 class TestRegisterHooks:
     def test_registers_post_render_and_game_finish(self) -> None:
         plugin = CloudflarePlugin()
@@ -100,6 +108,7 @@ class TestRegisterHooks:
 
         assert registry.has_handlers(Hook.POST_RENDER)
         assert registry.has_handlers(Hook.ON_GAME_FINISH)
+        assert registry.has_handlers(Hook.ON_POST_GAME_FINISH)
 
 
 def _make_context(
@@ -380,12 +389,232 @@ class TestOnPostRenderFullFlow:
         assert r2_config.public_url_base == "https://cdn.example.com/"
 
 
+class TestOnPostRenderTracksKeys:
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_appends_key(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.return_value = "https://cdn.example.com/highlight.mp4"
+        result = FakeRenderResult(output=video_file)
+        plugin = CloudflarePlugin(plugin_config)
+        context = _make_context(data={"result": result})
+
+        plugin.on_post_render(context)
+
+        assert plugin._uploaded_keys == ["highlight.mp4"]
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_with_prefix_appends_prefixed_key(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.return_value = "https://cdn.example.com/reels/highlight.mp4"
+        plugin_config["upload_prefix"] = "reels"
+        result = FakeRenderResult(output=video_file)
+        plugin = CloudflarePlugin(plugin_config)
+        context = _make_context(data={"result": result})
+
+        plugin.on_post_render(context)
+
+        assert plugin._uploaded_keys == ["reels/highlight.mp4"]
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_failure_does_not_track_key(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.side_effect = R2Error("fail")
+        result = FakeRenderResult(output=video_file)
+        plugin = CloudflarePlugin(plugin_config)
+        context = _make_context(data={"result": result})
+
+        plugin.on_post_render(context)
+
+        assert plugin._uploaded_keys == []
+
+
 class TestOnGameFinish:
-    def test_on_game_finish_no_op(self) -> None:
+    def test_on_game_finish_resets_uploaded_keys(self) -> None:
         plugin = CloudflarePlugin()
+        plugin._uploaded_keys = ["key1.mp4", "key2.mp4"]
         context = HookContext(hook=Hook.ON_GAME_FINISH, data={}, shared={})
-        # Should not raise
         plugin.on_game_finish(context)
+        assert plugin._uploaded_keys == []
+
+
+def _make_post_game_context(
+    shared: dict[str, Any] | None = None,
+) -> HookContext:
+    return HookContext(
+        hook=Hook.ON_POST_GAME_FINISH,
+        data={},
+        shared=shared if shared is not None else {},
+    )
+
+
+class TestOnPostGameFinishDisabled:
+    def test_cleanup_disabled_by_default(self) -> None:
+        plugin = CloudflarePlugin({})
+        plugin._uploaded_keys = ["key.mp4"]
+        context = _make_post_game_context()
+        plugin.on_post_game_finish(context)
+        # Keys not cleared — handler returned early
+        assert plugin._uploaded_keys == ["key.mp4"]
+
+    def test_cleanup_explicitly_disabled(self) -> None:
+        plugin = CloudflarePlugin({"cleanup_after_game": False})
+        plugin._uploaded_keys = ["key.mp4"]
+        context = _make_post_game_context()
+        plugin.on_post_game_finish(context)
+        assert plugin._uploaded_keys == ["key.mp4"]
+
+
+class TestOnPostGameFinishNoUploads:
+    def test_no_uploads_no_deletes(self, r2_env: None) -> None:
+        plugin = CloudflarePlugin({"cleanup_after_game": True})
+        context = _make_post_game_context()
+        plugin.on_post_game_finish(context)
+        assert plugin._uploaded_keys == []
+
+
+class TestOnPostGameFinishCredentialFailure:
+    def test_credential_failure_warns(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin = CloudflarePlugin({
+            "cleanup_after_game": True,
+            "r2_access_key_env": "",
+            "r2_secret_key_env": "",
+        })
+        plugin._uploaded_keys = ["key.mp4"]
+        context = _make_post_game_context()
+        with caplog.at_level(logging.WARNING):
+            plugin.on_post_game_finish(context)
+        assert "credentials unavailable" in caplog.text
+
+
+class TestOnPostGameFinishDryRun:
+    def test_dry_run_logs_without_deleting(
+        self,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        plugin_config["cleanup_after_game"] = True
+        plugin_config["dry_run"] = True
+        plugin = CloudflarePlugin(plugin_config)
+        plugin._uploaded_keys = ["key1.mp4", "key2.mp4"]
+        context = _make_post_game_context()
+        with caplog.at_level(logging.INFO):
+            plugin.on_post_game_finish(context)
+        assert "DRY RUN" in caplog.text
+        assert "key1.mp4" in caplog.text
+        assert "key2.mp4" in caplog.text
+
+
+class TestOnPostGameFinishFullFlow:
+    @patch("reeln_cloudflare_plugin.r2.delete_object")
+    def test_deletes_all_uploaded_keys(
+        self,
+        mock_delete: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+    ) -> None:
+        plugin_config["cleanup_after_game"] = True
+        plugin = CloudflarePlugin(plugin_config)
+        plugin._uploaded_keys = ["a.mp4", "b.mp4", "c.mp4"]
+        context = _make_post_game_context()
+
+        plugin.on_post_game_finish(context)
+
+        assert mock_delete.call_count == 3
+        deleted_keys = [call[0][1] for call in mock_delete.call_args_list]
+        assert deleted_keys == ["a.mp4", "b.mp4", "c.mp4"]
+
+    @patch("reeln_cloudflare_plugin.r2.delete_object")
+    def test_delete_failure_non_fatal(
+        self,
+        mock_delete: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        mock_delete.side_effect = [
+            None,
+            R2Error("Access denied"),
+            None,
+        ]
+        plugin_config["cleanup_after_game"] = True
+        plugin = CloudflarePlugin(plugin_config)
+        plugin._uploaded_keys = ["a.mp4", "b.mp4", "c.mp4"]
+        context = _make_post_game_context()
+
+        with caplog.at_level(logging.WARNING):
+            plugin.on_post_game_finish(context)
+
+        assert mock_delete.call_count == 3
+        assert "failed to delete" in caplog.text
+        assert "b.mp4" in caplog.text
+
+    @patch("reeln_cloudflare_plugin.r2.delete_object")
+    def test_passes_correct_r2_config(
+        self,
+        mock_delete: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+    ) -> None:
+        plugin_config["cleanup_after_game"] = True
+        plugin_config["r2_region"] = "us-east-1"
+        plugin = CloudflarePlugin(plugin_config)
+        plugin._uploaded_keys = ["key.mp4"]
+        context = _make_post_game_context()
+
+        plugin.on_post_game_finish(context)
+
+        call_args = mock_delete.call_args
+        r2_config = call_args[0][0]
+        assert r2_config.endpoint == "https://account-id.r2.cloudflarestorage.com"
+        assert r2_config.bucket == "test-bucket"
+        assert r2_config.region == "us-east-1"
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    @patch("reeln_cloudflare_plugin.r2.delete_object")
+    def test_full_upload_then_cleanup(
+        self,
+        mock_delete: Any,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.return_value = "https://cdn.example.com/highlight.mp4"
+        plugin_config["cleanup_after_game"] = True
+        plugin = CloudflarePlugin(plugin_config)
+
+        # Simulate POST_RENDER
+        result = FakeRenderResult(output=video_file)
+        render_ctx = _make_context(data={"result": result})
+        plugin.on_post_render(render_ctx)
+
+        assert plugin._uploaded_keys == ["highlight.mp4"]
+
+        # Simulate ON_POST_GAME_FINISH
+        finish_ctx = _make_post_game_context()
+        plugin.on_post_game_finish(finish_ctx)
+
+        mock_delete.assert_called_once()
+        assert mock_delete.call_args[0][1] == "highlight.mp4"
 
 
 class TestDefaultConfig:

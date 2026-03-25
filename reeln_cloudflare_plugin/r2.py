@@ -81,6 +81,27 @@ def upload_file(config: R2Config, source: Path, key: str) -> str:
     return f"{base}/{key}"
 
 
+def delete_object(config: R2Config, key: str) -> None:
+    """Delete an object from the R2 bucket.
+
+    Args:
+        config: R2 connection configuration.
+        key: Object key to delete.
+
+    Raises:
+        R2Error: If client creation or deletion fails.
+    """
+    try:
+        s3 = _create_client(config)
+    except Exception as exc:
+        raise R2Error(f"Failed to create R2 client: {exc}") from exc
+
+    try:
+        s3.delete_object(Bucket=config.bucket, Key=key)
+    except Exception as exc:
+        raise R2Error(f"R2 delete failed: {exc}") from exc
+
+
 def object_exists(config: R2Config, key: str) -> bool:
     """Check whether an object exists in the R2 bucket.
 

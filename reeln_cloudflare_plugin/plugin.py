@@ -24,7 +24,7 @@ class CloudflarePlugin:
     """
 
     name: str = "cloudflare"
-    version: str = "0.1.0"
+    version: str = "0.2.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
@@ -78,6 +78,12 @@ class CloudflarePlugin:
                 description="Max upload bandwidth in KB/s (0 = unlimited)",
             ),
             ConfigField(
+                name="cleanup_after_game",
+                field_type="bool",
+                default=False,
+                description="Delete uploaded R2 objects on ON_POST_GAME_FINISH",
+            ),
+            ConfigField(
                 name="dry_run",
                 field_type="bool",
                 default=False,
@@ -94,11 +100,13 @@ class CloudflarePlugin:
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self._config: dict[str, Any] = config or {}
+        self._uploaded_keys: list[str] = []
 
     def register(self, registry: HookRegistry) -> None:
         """Register hook handlers with the reeln plugin registry."""
         registry.register(Hook.POST_RENDER, self.on_post_render)
         registry.register(Hook.ON_GAME_FINISH, self.on_game_finish)
+        registry.register(Hook.ON_POST_GAME_FINISH, self.on_post_game_finish)
 
     def on_post_render(self, context: HookContext) -> None:
         """Handle ``POST_RENDER`` — upload rendered video to R2."""
@@ -153,6 +161,7 @@ class CloudflarePlugin:
             log.warning("Cloudflare plugin: upload failed (non-fatal): %s", exc)
             return
 
+        self._uploaded_keys.append(key)
         context.shared["video_url"] = public_url
         log.info("Cloudflare plugin: uploaded %s → %s", output, public_url)
 
@@ -187,4 +196,52 @@ class CloudflarePlugin:
         return access_key_id, secret_access_key
 
     def on_game_finish(self, context: HookContext) -> None:
-        """Handle ``ON_GAME_FINISH`` — forward-compatible cleanup hook."""
+        """Handle ``ON_GAME_FINISH`` — reset uploaded keys list."""
+        self._uploaded_keys = []
+
+    def on_post_game_finish(self, context: HookContext) -> None:
+        """Handle ``ON_POST_GAME_FINISH`` — delete uploaded R2 objects."""
+        if not self._config.get("cleanup_after_game"):
+            return
+
+        if not self._uploaded_keys:
+            return
+
+        credentials = self._resolve_credentials()
+        if credentials is None:
+            log.warning(
+                "Cloudflare plugin: cannot cleanup R2 objects — credentials "
+                "unavailable"
+            )
+            return
+
+        access_key_id, secret_access_key = credentials
+
+        config = r2.R2Config(
+            endpoint=self._config.get("r2_endpoint", ""),
+            bucket=self._config.get("r2_bucket", ""),
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            public_url_base=self._config.get("public_url_base", ""),
+            region=self._config.get("r2_region", "auto"),
+        )
+
+        if self._config.get("dry_run"):
+            for key in self._uploaded_keys:
+                log.info(
+                    "Cloudflare plugin: [DRY RUN] would delete R2 object: %s",
+                    key,
+                )
+            return
+
+        for key in self._uploaded_keys:
+            try:
+                r2.delete_object(config, key)
+                log.info("Cloudflare plugin: deleted R2 object: %s", key)
+            except r2.R2Error as exc:
+                log.warning(
+                    "Cloudflare plugin: failed to delete R2 object %s "
+                    "(non-fatal): %s",
+                    key,
+                    exc,
+                )
