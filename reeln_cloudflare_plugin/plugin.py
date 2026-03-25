@@ -1,0 +1,190 @@
+"""CloudflarePlugin — reeln-cli plugin for Cloudflare R2 video uploads."""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
+from reeln.plugins.hooks import Hook, HookContext
+from reeln.plugins.registry import HookRegistry
+
+from reeln_cloudflare_plugin import r2
+
+log: logging.Logger = logging.getLogger(__name__)
+
+
+class CloudflarePlugin:
+    """Plugin that uploads rendered videos to Cloudflare R2.
+
+    Subscribes to ``POST_RENDER`` to upload the rendered video file and
+    writes the public CDN URL to ``context.shared["video_url"]`` for
+    downstream plugins (e.g. Meta Reels publishing).
+    """
+
+    name: str = "cloudflare"
+    version: str = "0.1.0"
+    api_version: int = 1
+
+    config_schema: PluginConfigSchema = PluginConfigSchema(
+        fields=(
+            ConfigField(
+                name="r2_endpoint",
+                field_type="str",
+                required=True,
+                description="Cloudflare R2 S3-compatible endpoint URL",
+            ),
+            ConfigField(
+                name="r2_bucket",
+                field_type="str",
+                required=True,
+                description="R2 bucket name",
+            ),
+            ConfigField(
+                name="r2_access_key_env",
+                field_type="str",
+                required=True,
+                description="Environment variable name containing the R2 access key ID",
+            ),
+            ConfigField(
+                name="r2_secret_key_env",
+                field_type="str",
+                required=True,
+                description="Environment variable name containing the R2 secret access key",
+            ),
+            ConfigField(
+                name="public_url_base",
+                field_type="str",
+                required=True,
+                description="Public CDN base URL for uploaded objects",
+            ),
+            ConfigField(
+                name="upload_video",
+                field_type="bool",
+                default=False,
+                description="Enable video upload to R2 on POST_RENDER",
+            ),
+            ConfigField(
+                name="upload_prefix",
+                field_type="str",
+                default="",
+                description="Optional key prefix (folder) for uploaded objects",
+            ),
+            ConfigField(
+                name="upload_max_kbps",
+                field_type="int",
+                default=0,
+                description="Max upload bandwidth in KB/s (0 = unlimited)",
+            ),
+            ConfigField(
+                name="dry_run",
+                field_type="bool",
+                default=False,
+                description="Log upload actions without executing them",
+            ),
+            ConfigField(
+                name="r2_region",
+                field_type="str",
+                default="auto",
+                description="R2 region (usually 'auto')",
+            ),
+        )
+    )
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self._config: dict[str, Any] = config or {}
+
+    def register(self, registry: HookRegistry) -> None:
+        """Register hook handlers with the reeln plugin registry."""
+        registry.register(Hook.POST_RENDER, self.on_post_render)
+        registry.register(Hook.ON_GAME_FINISH, self.on_game_finish)
+
+    def on_post_render(self, context: HookContext) -> None:
+        """Handle ``POST_RENDER`` — upload rendered video to R2."""
+        if not self._config.get("upload_video"):
+            return
+
+        result = context.data.get("result")
+        if result is None:
+            log.warning("Cloudflare plugin: no result in context data, skipping")
+            return
+
+        output = getattr(result, "output", None)
+        if output is None or not output.exists():
+            log.warning(
+                "Cloudflare plugin: output file not found: %s, skipping", output
+            )
+            return
+
+        credentials = self._resolve_credentials()
+        if credentials is None:
+            return
+
+        access_key_id, secret_access_key = credentials
+
+        prefix = self._config.get("upload_prefix", "")
+        filename = output.name
+        key = f"{prefix}/{filename}" if prefix else filename
+
+        if self._config.get("dry_run"):
+            base = self._config.get("public_url_base", "").rstrip("/")
+            url = f"{base}/{key}"
+            log.info(
+                "Cloudflare plugin: [DRY RUN] would upload %s → %s",
+                output,
+                url,
+            )
+            return
+
+        config = r2.R2Config(
+            endpoint=self._config.get("r2_endpoint", ""),
+            bucket=self._config.get("r2_bucket", ""),
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            public_url_base=self._config.get("public_url_base", ""),
+            region=self._config.get("r2_region", "auto"),
+            upload_max_kbps=int(self._config.get("upload_max_kbps", 0)),
+        )
+
+        try:
+            public_url = r2.upload_file(config, output, key)
+        except r2.R2Error as exc:
+            log.warning("Cloudflare plugin: upload failed (non-fatal): %s", exc)
+            return
+
+        context.shared["video_url"] = public_url
+        log.info("Cloudflare plugin: uploaded %s → %s", output, public_url)
+
+    def _resolve_credentials(self) -> tuple[str, str] | None:
+        """Read R2 credentials from environment variables named in config.
+
+        Returns:
+            Tuple of (access_key_id, secret_access_key), or None on failure.
+        """
+        access_key_env = self._config.get("r2_access_key_env", "")
+        secret_key_env = self._config.get("r2_secret_key_env", "")
+
+        if not access_key_env or not secret_key_env:
+            log.warning(
+                "Cloudflare plugin: r2_access_key_env and r2_secret_key_env "
+                "must be configured, skipping"
+            )
+            return None
+
+        access_key_id = os.environ.get(access_key_env, "")
+        secret_access_key = os.environ.get(secret_key_env, "")
+
+        if not access_key_id or not secret_access_key:
+            log.warning(
+                "Cloudflare plugin: environment variables %s and/or %s are "
+                "empty or not set, skipping",
+                access_key_env,
+                secret_key_env,
+            )
+            return None
+
+        return access_key_id, secret_access_key
+
+    def on_game_finish(self, context: HookContext) -> None:
+        """Handle ``ON_GAME_FINISH`` — forward-compatible cleanup hook."""
