@@ -1,6 +1,6 @@
 PLUGIN_PKG := reeln_cloudflare_plugin
 
-.PHONY: dev-install install reeln-install test lint format check
+.PHONY: dev-install install test lint format check
 
 VENV := .venv/bin
 
@@ -10,9 +10,6 @@ dev-install:
 	uv pip install -e ".[dev]"
 
 install:
-	uv pip install --python ~/.local/share/uv/tools/reeln/bin/python3 -e .
-
-reeln-install:
 	uv pip install --python ../reeln-cli/.venv/bin/python -e .
 
 test:
