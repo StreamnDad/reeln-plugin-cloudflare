@@ -6,6 +6,7 @@ import logging
 import os
 from typing import Any
 
+from reeln.models.auth import AuthCheckResult, AuthStatus
 from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
@@ -24,7 +25,7 @@ class CloudflarePlugin:
     """
 
     name: str = "cloudflare"
-    version: str = "0.2.0"
+    version: str = "0.3.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
@@ -194,6 +195,78 @@ class CloudflarePlugin:
             return None
 
         return access_key_id, secret_access_key
+
+    def auth_check(self) -> list[AuthCheckResult]:
+        """Validate R2 credentials by connecting to the bucket."""
+        endpoint = self._config.get("r2_endpoint", "")
+        bucket = self._config.get("r2_bucket", "")
+        if not endpoint or not bucket:
+            return [AuthCheckResult(
+                service="Cloudflare R2",
+                status=AuthStatus.NOT_CONFIGURED,
+                message="r2_endpoint and r2_bucket must be configured",
+                hint="Set r2_endpoint and r2_bucket in plugin config",
+            )]
+
+        creds = self._resolve_credentials()
+        if creds is None:
+            access_key_env = self._config.get("r2_access_key_env", "")
+            secret_key_env = self._config.get("r2_secret_key_env", "")
+            return [AuthCheckResult(
+                service="Cloudflare R2",
+                status=AuthStatus.FAIL,
+                message=(
+                    f"Environment variables {access_key_env} and/or "
+                    f"{secret_key_env} are empty or not set"
+                ),
+                hint=(
+                    f"Set {access_key_env} and {secret_key_env} "
+                    f"environment variables"
+                ),
+            )]
+
+        access_key_id, secret_access_key = creds
+        config = r2.R2Config(
+            endpoint=endpoint,
+            bucket=bucket,
+            access_key_id=access_key_id,
+            secret_access_key=secret_access_key,
+            public_url_base=self._config.get("public_url_base", ""),
+            region=self._config.get("r2_region", "auto"),
+        )
+
+        try:
+            client = r2._create_client(config)
+            client.head_bucket(Bucket=bucket)
+        except Exception as exc:
+            return [AuthCheckResult(
+                service="Cloudflare R2",
+                status=AuthStatus.FAIL,
+                message=f"R2 connection failed: {exc}",
+                hint="Verify R2 credentials and endpoint",
+            )]
+
+        return [AuthCheckResult(
+            service="Cloudflare R2",
+            status=AuthStatus.OK,
+            message="Connected",
+            identity=f"bucket: {bucket}",
+        )]
+
+    def auth_refresh(self) -> list[AuthCheckResult]:
+        """R2 credentials are env-var based and cannot be refreshed."""
+        return [AuthCheckResult(
+            service="Cloudflare R2",
+            status=AuthStatus.FAIL,
+            message=(
+                "R2 credentials are set via environment variables "
+                "and cannot be refreshed automatically"
+            ),
+            hint=(
+                "Update the environment variables referenced in "
+                "r2_access_key_env and r2_secret_key_env"
+            ),
+        )]
 
     def on_game_finish(self, context: HookContext) -> None:
         """Handle ``ON_GAME_FINISH`` — reset uploaded keys list."""

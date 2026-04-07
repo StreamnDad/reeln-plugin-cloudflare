@@ -625,3 +625,153 @@ class TestDefaultConfig:
     def test_none_config(self) -> None:
         plugin = CloudflarePlugin(None)
         assert plugin._config == {}
+
+
+# ------------------------------------------------------------------
+# auth_check
+# ------------------------------------------------------------------
+
+
+class TestAuthCheckNotConfigured:
+    def test_missing_endpoint(self) -> None:
+        plugin = CloudflarePlugin({"r2_endpoint": "", "r2_bucket": "b"})
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].service == "Cloudflare R2"
+        assert results[0].status.value == "not_configured"
+        assert "r2_endpoint" in results[0].message
+
+    def test_missing_bucket(self) -> None:
+        plugin = CloudflarePlugin({"r2_endpoint": "https://x.r2.cloudflarestorage.com", "r2_bucket": ""})
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].status.value == "not_configured"
+        assert "r2_bucket" in results[0].message
+
+    def test_both_missing(self) -> None:
+        plugin = CloudflarePlugin({})
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].status.value == "not_configured"
+        assert "r2_endpoint" in results[0].hint
+
+
+class TestAuthCheckEnvVarsNotSet:
+    def test_env_vars_missing(
+        self,
+        plugin_config: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("R2_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+        plugin = CloudflarePlugin(plugin_config)
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].service == "Cloudflare R2"
+        assert results[0].status.value == "fail"
+        assert "R2_ACCESS_KEY_ID" in results[0].message
+        assert "R2_SECRET_ACCESS_KEY" in results[0].message
+
+    def test_env_var_names_in_hint(
+        self,
+        plugin_config: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("R2_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+        plugin = CloudflarePlugin(plugin_config)
+        results = plugin.auth_check()
+        assert "R2_ACCESS_KEY_ID" in results[0].hint
+        assert "R2_SECRET_ACCESS_KEY" in results[0].hint
+
+
+class TestAuthCheckHeadBucketFails:
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_head_bucket_client_error(
+        self,
+        mock_create: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+    ) -> None:
+        from botocore.exceptions import ClientError
+
+        mock_client = mock_create.return_value
+        mock_client.head_bucket.side_effect = ClientError(
+            {"Error": {"Code": "403", "Message": "Forbidden"}},
+            "HeadBucket",
+        )
+        plugin = CloudflarePlugin(plugin_config)
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].status.value == "fail"
+        assert "R2 connection failed" in results[0].message
+        assert "Verify R2 credentials" in results[0].hint
+
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_head_bucket_generic_exception(
+        self,
+        mock_create: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+    ) -> None:
+        mock_client = mock_create.return_value
+        mock_client.head_bucket.side_effect = RuntimeError("timeout")
+        plugin = CloudflarePlugin(plugin_config)
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].status.value == "fail"
+        assert "timeout" in results[0].message
+
+
+class TestAuthCheckSuccess:
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_connected_ok(
+        self,
+        mock_create: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+    ) -> None:
+        mock_client = mock_create.return_value
+        mock_client.head_bucket.return_value = {}
+        plugin = CloudflarePlugin(plugin_config)
+        results = plugin.auth_check()
+        assert len(results) == 1
+        assert results[0].service == "Cloudflare R2"
+        assert results[0].status.value == "ok"
+        assert results[0].message == "Connected"
+        assert results[0].identity == "bucket: test-bucket"
+
+    @patch("reeln_cloudflare_plugin.r2._create_client")
+    def test_head_bucket_called_with_correct_bucket(
+        self,
+        mock_create: Any,
+        plugin_config: dict[str, Any],
+        r2_env: None,
+    ) -> None:
+        mock_client = mock_create.return_value
+        mock_client.head_bucket.return_value = {}
+        plugin = CloudflarePlugin(plugin_config)
+        plugin.auth_check()
+        mock_client.head_bucket.assert_called_once_with(Bucket="test-bucket")
+
+
+# ------------------------------------------------------------------
+# auth_refresh
+# ------------------------------------------------------------------
+
+
+class TestAuthRefresh:
+    def test_always_returns_fail(self) -> None:
+        plugin = CloudflarePlugin()
+        results = plugin.auth_refresh()
+        assert len(results) == 1
+        assert results[0].service == "Cloudflare R2"
+        assert results[0].status.value == "fail"
+        assert "cannot be refreshed" in results[0].message
+
+    def test_hint_mentions_env_vars(self) -> None:
+        plugin = CloudflarePlugin()
+        results = plugin.auth_refresh()
+        assert "environment variables" in results[0].hint
+        assert "r2_access_key_env" in results[0].hint
+        assert "r2_secret_key_env" in results[0].hint
