@@ -23,7 +23,9 @@ class TestCloudflarePluginAttributes:
 
     def test_version(self) -> None:
         plugin = CloudflarePlugin()
-        assert plugin.version == "0.2.0"
+        from reeln_cloudflare_plugin import __version__
+
+        assert plugin.version == __version__
 
     def test_api_version(self) -> None:
         plugin = CloudflarePlugin()
