@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 from reeln.models.auth import AuthCheckResult, AuthStatus
 from reeln.models.plugin_schema import ConfigField, PluginConfigSchema
+from reeln.plugins.capabilities import UploaderSkipped
 from reeln.plugins.hooks import Hook, HookContext
 from reeln.plugins.registry import HookRegistry
 
@@ -109,42 +111,56 @@ class CloudflarePlugin:
         registry.register(Hook.ON_GAME_FINISH, self.on_game_finish)
         registry.register(Hook.ON_POST_GAME_FINISH, self.on_post_game_finish)
 
-    def on_post_render(self, context: HookContext) -> None:
-        """Handle ``POST_RENDER`` — upload rendered video to R2."""
+    def upload(
+        self, path: Path, *, metadata: dict[str, Any] | None = None
+    ) -> str:
+        """Upload a rendered video to Cloudflare R2 and return its public URL.
+
+        Implements the :class:`reeln.plugins.capabilities.Uploader` protocol
+        so the plugin can be used by ``reeln queue publish`` for truthful
+        per-target status reporting.
+
+        Raises:
+            UploaderSkipped: when ``upload_video`` is disabled in the plugin
+                config. The publish orchestrator maps this to
+                ``PublishStatus.SKIPPED`` (distinct from failure).
+            FileNotFoundError: when ``path`` does not exist on disk.
+            RuntimeError: when R2 credentials cannot be resolved from the
+                configured environment variables.
+            r2.R2Error: when the underlying R2 upload fails.
+        """
+        del metadata  # Not used today; accepted to satisfy Uploader protocol.
+
         if not self._config.get("upload_video"):
-            return
-
-        result = context.data.get("result")
-        if result is None:
-            log.warning("Cloudflare plugin: no result in context data, skipping")
-            return
-
-        output = getattr(result, "output", None)
-        if output is None or not output.exists():
-            log.warning(
-                "Cloudflare plugin: output file not found: %s, skipping", output
+            raise UploaderSkipped(
+                "upload_video disabled in cloudflare plugin config"
             )
-            return
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Cloudflare upload source not found: {path}"
+            )
 
         credentials = self._resolve_credentials()
         if credentials is None:
-            return
-
+            raise RuntimeError(
+                "Cloudflare R2 credentials not configured "
+                "(environment variables missing)"
+            )
         access_key_id, secret_access_key = credentials
 
         prefix = self._config.get("upload_prefix", "")
-        filename = output.name
-        key = f"{prefix}/{filename}" if prefix else filename
+        key = f"{prefix}/{path.name}" if prefix else path.name
 
         if self._config.get("dry_run"):
             base = self._config.get("public_url_base", "").rstrip("/")
-            url = f"{base}/{key}"
+            synthetic_url = f"{base}/{key}"
             log.info(
                 "Cloudflare plugin: [DRY RUN] would upload %s → %s",
-                output,
-                url,
+                path,
+                synthetic_url,
             )
-            return
+            return synthetic_url
 
         config = r2.R2Config(
             endpoint=self._config.get("r2_endpoint", ""),
@@ -156,15 +172,52 @@ class CloudflarePlugin:
             upload_max_kbps=int(self._config.get("upload_max_kbps", 0)),
         )
 
-        try:
-            public_url = r2.upload_file(config, output, key)
-        except r2.R2Error as exc:
-            log.warning("Cloudflare plugin: upload failed (non-fatal): %s", exc)
+        public_url = r2.upload_file(config, path, key)
+        self._uploaded_keys.append(key)
+        log.info("Cloudflare plugin: uploaded %s → %s", path, public_url)
+        return public_url
+
+    def on_post_render(self, context: HookContext) -> None:
+        """Handle ``POST_RENDER`` — delegate to :meth:`upload`.
+
+        Preserves the auto-publish-during-render contract: exceptions are
+        swallowed (an upload failure must never break the render pipeline)
+        and ``context.shared["video_url"]`` is populated on real success
+        so downstream plugins (e.g. meta reels) can consume it.
+        Dry-run behavior is preserved: the synthetic URL is logged but
+        NOT written to ``context.shared`` — downstream plugins should not
+        believe a real object exists when one does not.
+        """
+        result = context.data.get("result")
+        if result is None:
+            log.warning(
+                "Cloudflare plugin: no result in context data, skipping"
+            )
             return
 
-        self._uploaded_keys.append(key)
-        context.shared["video_url"] = public_url
-        log.info("Cloudflare plugin: uploaded %s → %s", output, public_url)
+        output = getattr(result, "output", None)
+        if output is None or not output.exists():
+            log.warning(
+                "Cloudflare plugin: output file not found: %s, skipping",
+                output,
+            )
+            return
+
+        try:
+            public_url = self.upload(
+                output, metadata=context.data.get("publish_metadata")
+            )
+        except UploaderSkipped as exc:
+            log.info("Cloudflare plugin: %s", exc)
+            return
+        except Exception as exc:
+            log.warning(
+                "Cloudflare plugin: upload failed (non-fatal): %s", exc
+            )
+            return
+
+        if not self._config.get("dry_run"):
+            context.shared["video_url"] = public_url
 
     def _resolve_credentials(self) -> tuple[str, str] | None:
         """Read R2 credentials from environment variables named in config.

@@ -137,6 +137,40 @@ class TestOnPostRenderDisabled:
         plugin.on_post_render(context)
         assert "video_url" not in context.shared
 
+    def test_feature_flag_disabled_with_valid_result_swallows_skipped(
+        self,
+        video_file: Path,
+        r2_env: None,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """on_post_render catches UploaderSkipped from upload() and returns.
+
+        This covers the auto-publish-during-render path: when upload_video
+        is disabled but the render pipeline still reaches on_post_render
+        with a valid result, the wrapper must swallow UploaderSkipped
+        (a render failure would break the pipeline) and not populate
+        video_url.
+        """
+        plugin = CloudflarePlugin(
+            {
+                "upload_video": False,
+                "r2_endpoint": "https://x.r2.cloudflarestorage.com",
+                "r2_bucket": "b",
+                "r2_access_key_env": "R2_ACCESS_KEY_ID",
+                "r2_secret_key_env": "R2_SECRET_ACCESS_KEY",
+                "public_url_base": "https://cdn.example.com",
+            }
+        )
+        result = FakeRenderResult(output=video_file)
+        context = _make_context(data={"result": result})
+
+        with caplog.at_level(logging.INFO):
+            plugin.on_post_render(context)
+
+        assert "video_url" not in context.shared
+        # The UploaderSkipped message should be logged at INFO.
+        assert "upload_video" in caplog.text
+
 
 class TestOnPostRenderMissingData:
     def test_missing_result(
@@ -777,3 +811,195 @@ class TestAuthRefresh:
         assert "environment variables" in results[0].hint
         assert "r2_access_key_env" in results[0].hint
         assert "r2_secret_key_env" in results[0].hint
+
+
+# ------------------------------------------------------------------
+# upload() — Uploader protocol implementation (manual publish path)
+# ------------------------------------------------------------------
+
+
+class TestUpload:
+    """Tests for the ``upload()`` method used by ``reeln queue publish``.
+
+    These cover the new path where the publish orchestrator calls the
+    plugin directly (instead of emitting POST_RENDER). They must raise on
+    failure and return the public URL on success — see
+    ``reeln.core.queue.publish_queue_item``.
+    """
+
+    def test_upload_video_disabled_raises_skipped(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        plugin_config["upload_video"] = False
+        plugin = CloudflarePlugin(plugin_config)
+
+        with pytest.raises(UploaderSkipped, match="upload_video"):
+            plugin.upload(video_file)
+
+    def test_upload_video_missing_raises_skipped(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        from reeln.plugins.capabilities import UploaderSkipped
+
+        del plugin_config["upload_video"]
+        plugin = CloudflarePlugin(plugin_config)
+
+        with pytest.raises(UploaderSkipped, match="upload_video"):
+            plugin.upload(video_file)
+
+    def test_upload_missing_source_raises_file_not_found(
+        self,
+        plugin_config: dict[str, Any],
+        tmp_path: Path,
+        r2_env: None,
+    ) -> None:
+        missing = tmp_path / "nonexistent.mp4"
+        plugin = CloudflarePlugin(plugin_config)
+
+        with pytest.raises(FileNotFoundError, match="nonexistent.mp4"):
+            plugin.upload(missing)
+
+    def test_upload_missing_credentials_raises_runtime_error(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("R2_ACCESS_KEY_ID", raising=False)
+        monkeypatch.delenv("R2_SECRET_ACCESS_KEY", raising=False)
+        plugin = CloudflarePlugin(plugin_config)
+
+        with pytest.raises(RuntimeError, match="credentials"):
+            plugin.upload(video_file)
+
+    def test_upload_dry_run_returns_synthetic_url(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        plugin_config["dry_run"] = True
+        plugin = CloudflarePlugin(plugin_config)
+
+        with patch("reeln_cloudflare_plugin.r2.upload_file") as mock_upload:
+            url = plugin.upload(video_file)
+
+        assert url == "https://cdn.example.com/highlight.mp4"
+        mock_upload.assert_not_called()
+        assert plugin._uploaded_keys == []
+
+    def test_upload_dry_run_strips_trailing_slash_on_base(
+        self,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        plugin_config["dry_run"] = True
+        plugin_config["public_url_base"] = "https://cdn.example.com/"
+        plugin = CloudflarePlugin(plugin_config)
+
+        url = plugin.upload(video_file)
+
+        assert url == "https://cdn.example.com/highlight.mp4"
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_success_returns_real_url(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.return_value = "https://cdn.example.com/highlight.mp4"
+        plugin = CloudflarePlugin(plugin_config)
+
+        url = plugin.upload(video_file)
+
+        assert url == "https://cdn.example.com/highlight.mp4"
+        mock_upload.assert_called_once()
+        assert plugin._uploaded_keys == ["highlight.mp4"]
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_with_prefix_uses_prefixed_key(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.return_value = "https://cdn.example.com/reels/highlight.mp4"
+        plugin_config["upload_prefix"] = "reels"
+        plugin = CloudflarePlugin(plugin_config)
+
+        plugin.upload(video_file)
+
+        call_args = mock_upload.call_args
+        assert call_args[0][2] == "reels/highlight.mp4"
+        assert plugin._uploaded_keys == ["reels/highlight.mp4"]
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_accepts_metadata_kwarg(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        """The Uploader protocol requires a metadata kwarg; we accept and ignore it."""
+        mock_upload.return_value = "https://cdn.example.com/highlight.mp4"
+        plugin = CloudflarePlugin(plugin_config)
+
+        url = plugin.upload(
+            video_file,
+            metadata={"title": "Goal!", "description": "What a shot"},
+        )
+
+        assert url == "https://cdn.example.com/highlight.mp4"
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_r2_error_propagates(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.side_effect = R2Error("bucket not found")
+        plugin = CloudflarePlugin(plugin_config)
+
+        with pytest.raises(R2Error, match="bucket not found"):
+            plugin.upload(video_file)
+
+        assert plugin._uploaded_keys == []
+
+    @patch("reeln_cloudflare_plugin.r2.upload_file")
+    def test_upload_passes_config_to_r2(
+        self,
+        mock_upload: Any,
+        plugin_config: dict[str, Any],
+        video_file: Path,
+        r2_env: None,
+    ) -> None:
+        mock_upload.return_value = "https://cdn.example.com/highlight.mp4"
+        plugin_config["r2_region"] = "us-east-1"
+        plugin_config["upload_max_kbps"] = 1000
+        plugin = CloudflarePlugin(plugin_config)
+
+        plugin.upload(video_file)
+
+        r2_config = mock_upload.call_args[0][0]
+        assert r2_config.region == "us-east-1"
+        assert r2_config.upload_max_kbps == 1000
+        assert r2_config.endpoint == "https://account-id.r2.cloudflarestorage.com"
+        assert r2_config.bucket == "test-bucket"
+        assert r2_config.public_url_base == "https://cdn.example.com"
+        assert r2_config.access_key_id == "test-access-key"
+        assert r2_config.secret_access_key == "test-secret-key"
