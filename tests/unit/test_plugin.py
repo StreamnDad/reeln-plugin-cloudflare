@@ -864,7 +864,7 @@ class TestUpload:
         missing = tmp_path / "nonexistent.mp4"
         plugin = CloudflarePlugin(plugin_config)
 
-        with pytest.raises(FileNotFoundError, match="nonexistent.mp4"):
+        with pytest.raises(FileNotFoundError, match=r"nonexistent\.mp4"):
             plugin.upload(missing)
 
     def test_upload_missing_credentials_raises_runtime_error(
