@@ -27,7 +27,7 @@ class CloudflarePlugin:
     """
 
     name: str = "cloudflare"
-    version: str = "0.3.0"
+    version: str = "0.4.0"
     api_version: int = 1
 
     config_schema: PluginConfigSchema = PluginConfigSchema(
